@@ -120,13 +120,22 @@ def selecionar(args, db):
     for nome in args.estabelecimentos:
         print(f"Lendo {nome}", flush=True)
         encontrados = []
+        lidos = locais = no_periodo = ativos = no_nicho = 0
         for r in linhas(nome):
+            lidos += 1
             if len(r) != 30:
                 raise ValueError(f"{nome}: registro com {len(r)} colunas, esperado 30")
-            if r[5] != "02" or r[19] != args.uf or not inicio <= r[10] <= fim:
+            if r[19] != args.uf:
                 continue
             if cidades is not None and r[20] not in cidades:
                 continue
+            locais += 1
+            if not inicio <= r[10] <= fim:
+                continue
+            no_periodo += 1
+            if r[5] != "02":
+                continue
+            ativos += 1
             if args.somente_matrizes and r[3] != "1":
                 continue
             cnae = r[11]
@@ -138,6 +147,7 @@ def selecionar(args, db):
                 continue
             if not tipo and cnae not in CNAES_VAREJO:
                 continue
+            no_nicho += 1
             tel1, wpp1 = telefone(r[21], r[22])
             tel2, wpp2 = telefone(r[23], r[24])
             email = r[27].strip()
@@ -152,6 +162,9 @@ def selecionar(args, db):
             ))
         db.executemany("INSERT OR IGNORE INTO contatos VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                        encontrados)
+        print(f"{nome.name} — lidos: {lidos:,} | na região: {locais:,} | "
+              f"no período: {no_periodo:,} | ativos: {ativos:,} | "
+              f"no nicho: {no_nicho:,} | com contato: {len(encontrados):,}", flush=True)
 
     raizes = {raiz for (raiz,) in db.execute("SELECT DISTINCT raiz FROM contatos")}
     for nome in args.empresas:
@@ -186,6 +199,10 @@ def exportar(args, db, temporario):
         for linha in db.execute(consulta):
             gravador.writerow(linha)
             total += 1
+    if total == 0:
+        print("Nenhum resultado com os filtros escolhidos. Confira as contagens por arquivo. "
+              "O CSV de destino foi preservado, caso já existisse.", flush=True)
+        return
     os.replace(temporario, args.saida)
     print(f"{total} registros gravados em {args.saida}", flush=True)
 
@@ -197,6 +214,8 @@ def main():
     parser.add_argument("--baixar", metavar="AAAA-MM", help="Baixar a competência oficial com curl")
     parser.add_argument("--lote", type=int, choices=range(10), action="append",
                         help="Usar apenas EstabelecimentosN.zip. Pode repetir.")
+    parser.add_argument("--arquivo", type=Path, action="append",
+                        help="Ler um ZIP, .ESTABELE ou .stable local. Pode repetir.")
     parser.add_argument("--saida", type=Path, default=Path("CSV/PEQUENO_VAREJO_GOIANIA_2026.csv"))
     parser.add_argument("--inicio", type=date.fromisoformat, default=date(2026, 1, 1))
     parser.add_argument("--fim", type=date.fromisoformat, default=date(2026, 11, 20))
@@ -206,6 +225,8 @@ def main():
     parser.add_argument("--somente-matrizes", action="store_true")
     parser.add_argument("--todos-go", action="store_true", help="Incluir todo Goiás, com Goiânia primeiro")
     args = parser.parse_args()
+    if args.arquivo and (args.baixar or args.lote):
+        parser.error("--arquivo é exclusivo de --baixar e --lote")
     if args.inicio > args.fim:
         parser.error("--inicio precisa ser anterior ou igual a --fim")
     if args.cnae and any(len(c) != 7 or not c.isascii() or not c.isdigit() for c in args.cnae):
@@ -223,7 +244,15 @@ def main():
                 arquivos = ["Municipios.zip", *lotes]
             baixar(args.pasta, args.baixar, arquivos)
         args.empresas = sorted(args.pasta.glob("*.EMPRECSV"))
-        if lotes:
+        if args.arquivo:
+            args.estabelecimentos = list(dict.fromkeys(args.arquivo))
+            if any(c.suffix.lower() not in {".zip", ".estabele", ".stable"} for c in args.estabelecimentos):
+                raise ValueError("Escolha arquivos ZIP, .ESTABELE ou .stable")
+            pastas = {arquivo.parent for arquivo in args.estabelecimentos}
+            args.empresas = sorted({*args.empresas, *(c for pasta in pastas
+                                  for padrao in ("*.EMPRECSV", "Empresas[0-9].zip")
+                                  for c in pasta.glob(padrao))})
+        elif lotes:
             args.estabelecimentos = [args.pasta / nome for nome in lotes]
             faltantes = [caminho.name for caminho in args.estabelecimentos if not caminho.is_file()]
             if faltantes:
@@ -231,7 +260,10 @@ def main():
             if not args.empresas:
                 args.empresas = sorted(args.pasta.glob("Empresas[0-9].zip"))
         else:
-            args.estabelecimentos = sorted(args.pasta.glob("*.ESTABELE"))
+            args.estabelecimentos = sorted(
+                c for c in args.pasta.iterdir()
+                if c.is_file() and c.suffix.lower() in {".estabele", ".stable"}
+            ) if args.pasta.is_dir() else []
             for atributo, prefixo in (("estabelecimentos", "Estabelecimentos"), ("empresas", "Empresas")):
                 arquivos_zip = [args.pasta / f"{prefixo}{i}.zip" for i in range(10)]
                 if not getattr(args, atributo) and any(caminho.exists() for caminho in arquivos_zip):
