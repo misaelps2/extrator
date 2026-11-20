@@ -1,0 +1,245 @@
+"""Extrai dados abertos do CNPJ da Receita Federal. Requer Python 3.10+."""
+import argparse
+import csv
+from datetime import date
+import io
+import os
+import re
+import subprocess
+from pathlib import Path
+import sqlite3
+from tempfile import TemporaryDirectory
+import unicodedata
+from zipfile import BadZipFile, ZipFile
+
+ARQUIVOS = (
+    ["Municipios.zip"]
+    + [f"Estabelecimentos{i}.zip" for i in range(10)]
+    + [f"Empresas{i}.zip" for i in range(10)]
+)
+
+
+BASE = "https://arquivos.receitafederal.gov.br/public.php/webdav/Dados/Cadastros/CNPJ"
+# Identificador do compartilhamento público da Receita Federal.
+CHAVE_PUBLICA = "gn672Ad4CF8N6TK"
+TIPOS = {
+    "EMPÓRIO": r"EMPORIO",
+    "MERCADINHO": r"MERCADINHO",
+    "MERCEARIA": r"MERCEARIA",
+    "QUITANDA": r"QUITANDA",
+    "MINIMERCADO": r"MINI ?MERCADO",
+    "PROD. NATURAIS": r"PRODUTOS NATURAIS?",
+    "CASA DE PRODUTOS": r"CASA DE PRODUTOS",
+}
+TIPOS = {tipo: re.compile(r"\b(?:" + regra + r")\b") for tipo, regra in TIPOS.items()}
+EXCLUIR = re.compile(
+    r"\b(?:ATACAREJO|ATACADAO|ATACADISTA|ATACADO|SUPER ?MERCADO|HIPER(?:MERCADO)?|"
+    r"MERCADAO|SACOLAO|ASSAI|CARREFOUR|WALMART|BIG|MAKRO|RODOVALE|TUEC|SAMS CLUB|"
+    r"DISTRIBUIDOR(?:A)?|DISTRIBUICAO|REPRESENTACOES|REPRESENTACAO|DEPOSITO|SUPRIMENTOS|"
+    r"ARMAZEM|ARMAZENS|LANCHONETE|RESTAURANTE|PADARIA|PANIFICADORA|ACOUGUE|PIZZARIA|"
+    r"HAMBURGUER(?:IA)?|FARMACIA|DROGARIA|POSTO|COMBUSTIVEL|CONVENIENCIA|SORVETERIA|"
+    r"SORVETES|ACAI|CAFE|BAR|DOCERIA|CONFEITARIA|BOLOS|HORTIFRUTI(?:GRANJEIRO)?)\b"
+)
+CNAES_VAREJO = {"4712100", "4729699", "4723700"}
+CNAES_EXCLUIDOS = {"4711301", "4711302", "4713001", "4771704"}
+EMAIL = re.compile(r"[^\s@,;]+@[^\s@,;.]+(?:\.[^\s@,;.]+)+")
+
+
+def baixar(pasta, competencia):
+    pasta.mkdir(parents=True, exist_ok=True)
+    for nome in ARQUIVOS:
+        destino = pasta / nome
+        if destino.is_file() and zip_valido(destino):
+            continue
+        parcial = destino.with_suffix(".zip.part")
+        if destino.is_file() and not parcial.exists():
+            destino.replace(parcial)
+        print(f"Baixando {nome}", flush=True)
+        subprocess.run([
+            "curl", "--fail", "--location", "--retry", "3",
+            "--continue-at", "-", "--user", f"{CHAVE_PUBLICA}:",
+            "--output", str(parcial), f"{BASE}/{competencia}/{nome}",
+        ], check=True)
+        if not zip_valido(parcial):
+            raise ValueError(f"Download incompleto: {parcial}")
+        parcial.replace(destino)
+
+
+def zip_valido(caminho):
+    try:
+        with ZipFile(caminho) as arquivo:
+            return bool(arquivo.infolist())
+    except BadZipFile:
+        return False
+
+
+def linhas(caminho):
+    if caminho.suffix.lower() != ".zip":
+        with caminho.open(encoding="latin-1", newline="") as dados:
+            yield from csv.reader(dados, delimiter=";")
+        return
+    with ZipFile(caminho) as arquivo:
+        membros = [item for item in arquivo.infolist() if not item.is_dir()]
+        if len(membros) != 1:
+            raise ValueError(f"{caminho.name}: esperado um arquivo de dados no ZIP")
+        with arquivo.open(membros[0]) as dados:
+            with io.TextIOWrapper(dados, encoding="latin-1", newline="") as leitor:
+                yield from csv.reader(leitor, delimiter=";")
+
+
+def normalizar(texto):
+    return unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode().upper()
+
+
+def telefone(ddd, numero):
+    ddd = re.sub(r"[^0-9]", "", ddd).lstrip("0")
+    numero = re.sub(r"[^0-9]", "", numero)
+    if len(ddd) == 2 and len(numero) in (8, 9) and int(numero):
+        return f"({ddd}) {numero}", f"55{ddd}{numero}"
+    return "", ""
+
+
+def selecionar(args, db):
+    if args.todos_go:
+        cidades = None
+    elif normalizar(args.municipio) == "GOIANIA" and args.uf == "GO":
+        cidades = {"9373"}
+    else:
+        cidades = {codigo for codigo, cidade in linhas(args.pasta / "Municipios.zip")
+                   if normalizar(cidade) == normalizar(args.municipio)}
+        if not cidades:
+            raise ValueError(f"Município ausente da tabela da Receita: {args.municipio}")
+    inicio, fim = (d.isoformat().replace("-", "") for d in (args.inicio, args.fim))
+
+    db.execute("""CREATE TABLE contatos (
+        cnpj TEXT PRIMARY KEY, raiz TEXT, goiania INTEGER, tipo TEXT, fantasia TEXT,
+        abertura TEXT, cnae TEXT, endereco TEXT, numero TEXT, complemento TEXT,
+        bairro TEXT, cep TEXT, municipio TEXT, uf TEXT, telefone TEXT, whatsapp TEXT,
+        telefone2 TEXT, email TEXT
+    )""")
+    db.execute("CREATE TABLE empresas (raiz TEXT PRIMARY KEY, razao TEXT)")
+    for nome in args.estabelecimentos:
+        print(f"Lendo {nome}", flush=True)
+        encontrados = []
+        for r in linhas(nome):
+            if len(r) != 30:
+                raise ValueError(f"{nome}: registro com {len(r)} colunas, esperado 30")
+            if r[5] != "02" or r[19] != args.uf or not inicio <= r[10] <= fim:
+                continue
+            if cidades is not None and r[20] not in cidades:
+                continue
+            if args.somente_matrizes and r[3] != "1":
+                continue
+            cnae = r[11]
+            nome_busca = normalizar(r[4])
+            if EXCLUIR.search(nome_busca) or cnae in CNAES_EXCLUIDOS:
+                continue
+            tipo = next((tipo for tipo, regra in TIPOS.items() if regra.search(nome_busca)), "")
+            if args.cnae and cnae not in args.cnae:
+                continue
+            if not tipo and cnae not in CNAES_VAREJO:
+                continue
+            tel1, wpp1 = telefone(r[21], r[22])
+            tel2, wpp2 = telefone(r[23], r[24])
+            email = r[27].strip()
+            email = email if EMAIL.fullmatch(email) else ""
+            if not (tel1 or tel2 or email):
+                continue
+            encontrados.append((
+                "".join(r[:3]), r[0], int(r[19] == "GO" and r[20] == "9373"),
+                tipo or "OUTROS", r[4].strip(), f"{r[10][6:8]}/{r[10][4:6]}/{r[10][:4]}",
+                cnae, " ".join(filter(None, r[13:15])), r[15], r[16], r[17], r[18],
+                r[20], r[19], tel1 or tel2, wpp1 or wpp2, tel2 if tel1 else "", email
+            ))
+        db.executemany("INSERT OR IGNORE INTO contatos VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                       encontrados)
+
+    raizes = {raiz for (raiz,) in db.execute("SELECT DISTINCT raiz FROM contatos")}
+    for nome in args.empresas:
+        if not raizes:
+            return
+        print(f"Lendo {nome}", flush=True)
+        encontrados = []
+        for r in linhas(nome):
+            if r[0] in raizes:
+                encontrados.append((r[0], r[1]))
+                raizes.remove(r[0])
+        db.executemany("INSERT INTO empresas VALUES (?,?)", encontrados)
+    if raizes:
+        print(f"{len(raizes)} CNPJs sem razão social nos arquivos fornecidos.", flush=True)
+
+
+def exportar(args, db, temporario):
+    consulta = """SELECT c.cnpj, CASE c.goiania WHEN 1 THEN 'True' ELSE 'False' END,
+                         c.tipo, c.fantasia, c.abertura, c.cnae, c.endereco, c.numero,
+                         c.complemento, c.bairro, c.cep, c.municipio, c.uf, c.telefone,
+                         c.whatsapp, c.email, COALESCE(e.razao, ''), c.telefone2
+                  FROM contatos c LEFT JOIN empresas e ON e.raiz = c.raiz
+                  ORDER BY c.goiania DESC, c.tipo, c.fantasia, c.cnpj"""
+    colunas = ("CNPJ", "EM_GOIANIA", "TIPO", "NOME_FANTASIA", "DATA_ABERTURA",
+               "CNAE_PRINCIPAL", "ENDERECO", "NUMERO", "COMPLEMENTO", "BAIRRO", "CEP",
+               "MUNICIPIO_COD", "UF", "TELEFONE", "WHATSAPP", "EMAIL", "RAZAO_SOCIAL",
+               "TELEFONE_2")
+    total = 0
+    with temporario.open("w", encoding="utf-8-sig", newline="") as saida:
+        gravador = csv.writer(saida, delimiter=";")
+        gravador.writerow(colunas)
+        for linha in db.execute(consulta):
+            gravador.writerow(linha)
+            total += 1
+    os.replace(temporario, args.saida)
+    print(f"{total} registros gravados em {args.saida}", flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("pasta", nargs="?", type=Path, default=Path("dump"),
+                        help="Pasta dos ZIPs oficiais ou arquivos .ESTABELE e .EMPRECSV")
+    parser.add_argument("--baixar", metavar="AAAA-MM", help="Baixar a competência oficial com curl")
+    parser.add_argument("--saida", type=Path, default=Path("CSV/PEQUENO_VAREJO_GOIANIA_2026.csv"))
+    parser.add_argument("--inicio", type=date.fromisoformat, default=date(2026, 1, 1))
+    parser.add_argument("--fim", type=date.fromisoformat, default=date(2026, 11, 20))
+    parser.add_argument("--municipio", default="Goiânia")
+    parser.add_argument("--uf", default="GO", type=str.upper)
+    parser.add_argument("--cnae", action="append", help="CNAE principal com 7 dígitos. Pode repetir.")
+    parser.add_argument("--somente-matrizes", action="store_true")
+    parser.add_argument("--todos-go", action="store_true", help="Incluir todo Goiás, com Goiânia primeiro")
+    args = parser.parse_args()
+    if args.inicio > args.fim:
+        parser.error("--inicio precisa ser anterior ou igual a --fim")
+    if args.cnae and any(len(c) != 7 or not c.isascii() or not c.isdigit() for c in args.cnae):
+        parser.error("Cada CNAE deve conter 7 dígitos")
+    if args.todos_go and args.uf != "GO":
+        parser.error("--todos-go exige a UF GO")
+    try:
+        if args.baixar:
+            if not re.fullmatch(r"[0-9]{4}-(0[1-9]|1[0-2])", args.baixar):
+                parser.error("--baixar exige AAAA-MM")
+            args.pasta = args.pasta / args.baixar
+            baixar(args.pasta, args.baixar)
+        args.estabelecimentos = sorted(args.pasta.glob("*.ESTABELE"))
+        args.empresas = sorted(args.pasta.glob("*.EMPRECSV"))
+        for atributo, prefixo in (("estabelecimentos", "Estabelecimentos"), ("empresas", "Empresas")):
+            arquivos_zip = [args.pasta / f"{prefixo}{i}.zip" for i in range(10)]
+            if not getattr(args, atributo) and any(caminho.exists() for caminho in arquivos_zip):
+                faltantes = [caminho.name for caminho in arquivos_zip if not caminho.is_file()]
+                if faltantes:
+                    raise ValueError("Lote incompleto, faltam " + ", ".join(faltantes))
+                setattr(args, atributo, arquivos_zip)
+        if not args.estabelecimentos:
+            raise ValueError(f"Nenhum arquivo .ESTABELE ou lote de ZIPs em {args.pasta}")
+        args.saida.parent.mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(dir=args.saida.parent) as temp:
+            pasta_temp = Path(temp)
+            db = sqlite3.connect(pasta_temp / "contatos.sqlite")
+            try:
+                selecionar(args, db)
+                exportar(args, db, pasta_temp / "contatos.csv")
+            finally:
+                db.close()
+    except (OSError, ValueError, csv.Error, sqlite3.Error, BadZipFile, subprocess.CalledProcessError) as erro:
+        parser.exit(1, f"Erro: {erro}\n")
+
+
+if __name__ == "__main__":
+    main()
