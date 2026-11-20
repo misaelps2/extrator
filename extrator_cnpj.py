@@ -19,9 +19,8 @@ ARQUIVOS = (
 )
 
 
-BASE = "https://arquivos.receitafederal.gov.br/public.php/webdav/Dados/Cadastros/CNPJ"
-# Identificador do compartilhamento público da Receita Federal.
-CHAVE_PUBLICA = "gn672Ad4CF8N6TK"
+# Para abrir no navegador: https://arquivos.receitafederal.gov.br/index.php/s/YggdBLfdninEJX9
+BASE = "https://arquivos.receitafederal.gov.br/public.php/dav/files/YggdBLfdninEJX9"
 TIPOS = {
     "EMPÓRIO": r"EMPORIO",
     "MERCADINHO": r"MERCADINHO",
@@ -57,7 +56,7 @@ def baixar(pasta, competencia):
         print(f"Baixando {nome}", flush=True)
         subprocess.run([
             "curl", "--fail", "--location", "--retry", "3",
-            "--continue-at", "-", "--user", f"{CHAVE_PUBLICA}:",
+            "--continue-at", "-",
             "--output", str(parcial), f"{BASE}/{competencia}/{nome}",
         ], check=True)
         if not zip_valido(parcial):
