@@ -44,9 +44,9 @@ CNAES_EXCLUIDOS = {"4711301", "4711302", "4713001", "4771704"}
 EMAIL = re.compile(r"[^\s@,;]+@[^\s@,;.]+(?:\.[^\s@,;.]+)+")
 
 
-def baixar(pasta, competencia):
+def baixar(pasta, competencia, arquivos=ARQUIVOS):
     pasta.mkdir(parents=True, exist_ok=True)
-    for nome in ARQUIVOS:
+    for nome in arquivos:
         destino = pasta / nome
         if destino.is_file() and zip_valido(destino):
             continue
@@ -195,6 +195,8 @@ def main():
     parser.add_argument("pasta", nargs="?", type=Path, default=Path("dump"),
                         help="Pasta dos ZIPs oficiais ou arquivos .ESTABELE e .EMPRECSV")
     parser.add_argument("--baixar", metavar="AAAA-MM", help="Baixar a competência oficial com curl")
+    parser.add_argument("--lote", type=int, choices=range(10), action="append",
+                        help="Usar apenas EstabelecimentosN.zip. Pode repetir.")
     parser.add_argument("--saida", type=Path, default=Path("CSV/PEQUENO_VAREJO_GOIANIA_2026.csv"))
     parser.add_argument("--inicio", type=date.fromisoformat, default=date(2026, 1, 1))
     parser.add_argument("--fim", type=date.fromisoformat, default=date(2026, 11, 20))
@@ -211,20 +213,32 @@ def main():
     if args.todos_go and args.uf != "GO":
         parser.error("--todos-go exige a UF GO")
     try:
+        lotes = [f"Estabelecimentos{i}.zip" for i in sorted(set(args.lote or []))]
         if args.baixar:
             if not re.fullmatch(r"[0-9]{4}-(0[1-9]|1[0-2])", args.baixar):
                 parser.error("--baixar exige AAAA-MM")
             args.pasta = args.pasta / args.baixar
-            baixar(args.pasta, args.baixar)
-        args.estabelecimentos = sorted(args.pasta.glob("*.ESTABELE"))
+            arquivos = lotes or ARQUIVOS
+            if lotes and not args.todos_go and (args.uf != "GO" or normalizar(args.municipio) != "GOIANIA"):
+                arquivos = ["Municipios.zip", *lotes]
+            baixar(args.pasta, args.baixar, arquivos)
         args.empresas = sorted(args.pasta.glob("*.EMPRECSV"))
-        for atributo, prefixo in (("estabelecimentos", "Estabelecimentos"), ("empresas", "Empresas")):
-            arquivos_zip = [args.pasta / f"{prefixo}{i}.zip" for i in range(10)]
-            if not getattr(args, atributo) and any(caminho.exists() for caminho in arquivos_zip):
-                faltantes = [caminho.name for caminho in arquivos_zip if not caminho.is_file()]
-                if faltantes:
-                    raise ValueError("Lote incompleto, faltam " + ", ".join(faltantes))
-                setattr(args, atributo, arquivos_zip)
+        if lotes:
+            args.estabelecimentos = [args.pasta / nome for nome in lotes]
+            faltantes = [caminho.name for caminho in args.estabelecimentos if not caminho.is_file()]
+            if faltantes:
+                raise ValueError("Arquivos selecionados ausentes: " + ", ".join(faltantes))
+            if not args.empresas:
+                args.empresas = sorted(args.pasta.glob("Empresas[0-9].zip"))
+        else:
+            args.estabelecimentos = sorted(args.pasta.glob("*.ESTABELE"))
+            for atributo, prefixo in (("estabelecimentos", "Estabelecimentos"), ("empresas", "Empresas")):
+                arquivos_zip = [args.pasta / f"{prefixo}{i}.zip" for i in range(10)]
+                if not getattr(args, atributo) and any(caminho.exists() for caminho in arquivos_zip):
+                    faltantes = [caminho.name for caminho in arquivos_zip if not caminho.is_file()]
+                    if faltantes:
+                        raise ValueError("Lote incompleto, faltam " + ", ".join(faltantes))
+                    setattr(args, atributo, arquivos_zip)
         if not args.estabelecimentos:
             raise ValueError(f"Nenhum arquivo .ESTABELE ou lote de ZIPs em {args.pasta}")
         args.saida.parent.mkdir(parents=True, exist_ok=True)
