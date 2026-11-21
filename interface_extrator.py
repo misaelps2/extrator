@@ -1,5 +1,6 @@
 """Interface local para download e extração de dados públicos do CNPJ."""
 from concurrent.futures import ThreadPoolExecutor
+import json
 from pathlib import Path
 from queue import Empty, Queue
 import re
@@ -41,6 +42,20 @@ def consultar_tamanhos(competencia, eventos):
     with ThreadPoolExecutor(max_workers=4) as pool:
         tamanhos = list(pool.map(lambda lote: tamanho_zip(competencia, lote), range(10)))
     eventos.put(("tamanhos", (competencia, tamanhos)))
+
+
+def lotes_processados(competencia, pasta=Path("dump")):
+    if not re.fullmatch(r"[0-9]{4}-(0[1-9]|1[0-2])", competencia):
+        return set()
+    processados = set()
+    for caminho in (pasta / competencia / "historico").glob("*.json"):
+        try:
+            registro = json.loads(caminho.read_text(encoding="utf-8"))
+            if registro["competencia"] == competencia:
+                processados.update(registro["lotes"])
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return processados
 
 
 def executar(comando, eventos):
@@ -102,10 +117,12 @@ def main():
     atualizar_botao = ttk.Button(config, text="Consultar tamanhos")
     atualizar_botao.pack(side="left")
 
-    lotes = ttk.Treeview(painel, columns=("arquivo", "tamanho"), show="headings", height=10)
+    lotes = ttk.Treeview(painel, columns=("arquivo", "tamanho", "historico"), show="headings", height=10)
     lotes.heading("arquivo", text="ZIP da Receita Federal")
     lotes.heading("tamanho", text="Tamanho no servidor")
-    lotes.column("arquivo", width=370)
+    lotes.heading("historico", text="Histórico")
+    lotes.column("arquivo", width=290)
+    lotes.column("historico", width=120)
     lotes.column("tamanho", width=170, anchor="e")
     for i in range(10):
         lotes.insert("", "end", iid=str(i), values=(f"Estabelecimentos{i}.zip", "—"))
@@ -122,6 +139,10 @@ def main():
         ttk.Label(filtros, text=rotulo).pack(side="left")
         ttk.Entry(filtros, width=12, textvariable=valor).pack(side="left", padx=(5, 12))
     ttk.Checkbutton(filtros, text="Todo Goiás (padrão: Goiânia)", variable=todos_go).pack(side="left")
+
+    limpar = tk.BooleanVar()
+    ttk.Checkbutton(painel, text="Liberar espaço após a extração (ZIPs desta execução)",
+                    variable=limpar).pack(anchor="w", pady=(3, 0))
 
     acoes = ttk.Frame(painel)
     acoes.pack(fill="x", pady=(8, 5))
@@ -168,9 +189,12 @@ def main():
 
     def atualizar_tabela(*_):
         mes = competencia.get().strip()
+        processados = lotes_processados(mes)
         for lote in lotes.get_children():
             valor = tamanhos.get((mes, lote))
             lotes.set(lote, "tamanho", tamanho_formatado(valor) if valor else "—")
+            nome = f"Estabelecimentos{lote}.zip"
+            lotes.set(lote, "historico", "Já processado" if nome in processados else "—")
         mostrar_resumo()
 
     def atualizar():
@@ -193,7 +217,7 @@ def main():
                 extrair.state(["!disabled"])
                 local.state(["!disabled"])
                 status.set(valor)
-                mostrar_resumo()
+                atualizar_tabela()
                 if not consultando:
                     barra.stop()
             else:
@@ -236,6 +260,8 @@ def main():
                 comando.extend(["--arquivo", arquivo])
         else:
             comando.extend(["--baixar", competencia.get().strip()])
+            if limpar.get():
+                comando.append("--limpar-downloads")
             for lote in selecao:
                 comando.extend(["--lote", lote])
         log.configure(state="normal")
@@ -260,7 +286,7 @@ def main():
     lotes.bind("<<TreeviewSelect>>", mostrar_resumo)
     competencia.trace_add("write", atualizar_tabela)
     janela.protocol("WM_DELETE_WINDOW", fechar)
-    mostrar_resumo()
+    atualizar_tabela()
     janela.after(100, consultar)
     atualizar()
     janela.mainloop()

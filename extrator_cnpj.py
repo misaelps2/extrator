@@ -1,8 +1,10 @@
 """Extrai dados abertos do CNPJ da Receita Federal. Requer Python 3.10+."""
 import argparse
+from contextlib import ExitStack
 import csv
-from datetime import date
+from datetime import date, datetime, timezone
 import io
+import json
 import os
 import re
 import subprocess
@@ -10,6 +12,7 @@ from pathlib import Path
 import sqlite3
 from tempfile import TemporaryDirectory
 import unicodedata
+from uuid import uuid4
 from zipfile import BadZipFile, ZipFile
 
 ARQUIVOS = (
@@ -104,7 +107,7 @@ def selecionar(args, db):
     elif normalizar(args.municipio) == "GOIANIA" and args.uf == "GO":
         cidades = {"9373"}
     else:
-        cidades = {codigo for codigo, cidade in linhas(args.pasta / "Municipios.zip")
+        cidades = {codigo for codigo, cidade in linhas(args.municipios)
                    if normalizar(cidade) == normalizar(args.municipio)}
         if not cidades:
             raise ValueError(f"Município ausente da tabela da Receita: {args.municipio}")
@@ -202,9 +205,39 @@ def exportar(args, db, temporario):
     if total == 0:
         print("Nenhum resultado com os filtros escolhidos. Confira as contagens por arquivo. "
               "O CSV de destino foi preservado, caso já existisse.", flush=True)
-        return
+        return 0
     os.replace(temporario, args.saida)
     print(f"{total} registros gravados em {args.saida}", flush=True)
+    return total
+
+
+def registrar_extracao(args, lotes, total):
+    pasta = args.pasta / "historico"
+    pasta.mkdir(parents=True, exist_ok=True)
+    agora = datetime.now(timezone.utc)
+    registro = {
+        "competencia": args.baixar,
+        "lotes": lotes,
+        "processado_em": agora.isoformat(),
+        "filtros": {
+            "inicio": args.inicio.isoformat(),
+            "fim": args.fim.isoformat(),
+            "municipio": None if args.todos_go else args.municipio,
+            "uf": args.uf,
+            "cnae": sorted(set(args.cnae or [])),
+            "somente_matrizes": args.somente_matrizes,
+        },
+        "registros": total,
+        "csv": str(args.saida.resolve()) if total else None,
+    }
+    destino = pasta / f"{agora:%Y%m%dT%H%M%S}-{uuid4().hex}.json"
+    parcial = destino.with_suffix(".tmp")
+    try:
+        parcial.write_text(json.dumps(registro, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(parcial, destino)
+    finally:
+        parcial.unlink(missing_ok=True)
+    print(f"Histórico salvo em {destino}", flush=True)
 
 
 def main():
@@ -214,6 +247,8 @@ def main():
     parser.add_argument("--baixar", metavar="AAAA-MM", help="Baixar a competência oficial com curl")
     parser.add_argument("--lote", type=int, choices=range(10), action="append",
                         help="Usar apenas EstabelecimentosN.zip. Pode repetir.")
+    parser.add_argument("--limpar-downloads", action="store_true",
+                        help="Usar espaço temporário para os novos ZIPs dos lotes selecionados.")
     parser.add_argument("--arquivo", type=Path, action="append",
                         help="Ler um ZIP, .ESTABELE ou .stable local. Pode repetir.")
     parser.add_argument("--saida", type=Path, default=Path("CSV/PEQUENO_VAREJO_GOIANIA_2026.csv"))
@@ -225,6 +260,8 @@ def main():
     parser.add_argument("--somente-matrizes", action="store_true")
     parser.add_argument("--todos-go", action="store_true", help="Incluir todo Goiás, com Goiânia primeiro")
     args = parser.parse_args()
+    if args.limpar_downloads and not (args.baixar and args.lote):
+        parser.error("--limpar-downloads exige --baixar e pelo menos um --lote")
     if args.arquivo and (args.baixar or args.lote):
         parser.error("--arquivo é exclusivo de --baixar e --lote")
     if args.inicio > args.fim:
@@ -234,56 +271,81 @@ def main():
     if args.todos_go and args.uf != "GO":
         parser.error("--todos-go exige a UF GO")
     try:
-        lotes = [f"Estabelecimentos{i}.zip" for i in sorted(set(args.lote or []))]
-        if args.baixar:
-            if not re.fullmatch(r"[0-9]{4}-(0[1-9]|1[0-2])", args.baixar):
-                parser.error("--baixar exige AAAA-MM")
-            args.pasta = args.pasta / args.baixar
-            arquivos = lotes or ARQUIVOS
-            if lotes and not args.todos_go and (args.uf != "GO" or normalizar(args.municipio) != "GOIANIA"):
-                arquivos = ["Municipios.zip", *lotes]
-            baixar(args.pasta, args.baixar, arquivos)
-        args.empresas = sorted(args.pasta.glob("*.EMPRECSV"))
-        if args.arquivo:
-            args.estabelecimentos = list(dict.fromkeys(args.arquivo))
-            if any(c.suffix.lower() not in {".zip", ".estabele", ".stable"} for c in args.estabelecimentos):
-                raise ValueError("Escolha arquivos ZIP, .ESTABELE ou .stable")
-            pastas = {arquivo.parent for arquivo in args.estabelecimentos}
-            args.empresas = sorted({*args.empresas, *(c for pasta in pastas
-                                  for padrao in ("*.EMPRECSV", "Empresas[0-9].zip")
-                                  for c in pasta.glob(padrao))})
-        elif lotes:
-            args.estabelecimentos = [args.pasta / nome for nome in lotes]
-            faltantes = [caminho.name for caminho in args.estabelecimentos if not caminho.is_file()]
-            if faltantes:
-                raise ValueError("Arquivos selecionados ausentes: " + ", ".join(faltantes))
-            if not args.empresas:
-                args.empresas = sorted(args.pasta.glob("Empresas[0-9].zip"))
-        else:
-            args.estabelecimentos = sorted(
-                c for c in args.pasta.iterdir()
-                if c.is_file() and c.suffix.lower() in {".estabele", ".stable"}
-            ) if args.pasta.is_dir() else []
-            for atributo, prefixo in (("estabelecimentos", "Estabelecimentos"), ("empresas", "Empresas")):
-                arquivos_zip = [args.pasta / f"{prefixo}{i}.zip" for i in range(10)]
-                if not getattr(args, atributo) and any(caminho.exists() for caminho in arquivos_zip):
-                    faltantes = [caminho.name for caminho in arquivos_zip if not caminho.is_file()]
-                    if faltantes:
-                        raise ValueError("Lote incompleto, faltam " + ", ".join(faltantes))
-                    setattr(args, atributo, arquivos_zip)
-        if not args.estabelecimentos:
-            raise ValueError(f"Nenhum arquivo .ESTABELE ou lote de ZIPs em {args.pasta}")
-        args.saida.parent.mkdir(parents=True, exist_ok=True)
-        with TemporaryDirectory(dir=args.saida.parent) as temp:
-            pasta_temp = Path(temp)
-            db = sqlite3.connect(pasta_temp / "contatos.sqlite")
-            try:
-                selecionar(args, db)
-                exportar(args, db, pasta_temp / "contatos.csv")
-            finally:
-                db.close()
+        with ExitStack() as recursos:
+            processar(args, parser, recursos)
     except (OSError, ValueError, csv.Error, sqlite3.Error, BadZipFile, subprocess.CalledProcessError) as erro:
         parser.exit(1, f"Erro: {erro}\n")
+
+
+def processar(args, parser, recursos):
+    lotes = [f"Estabelecimentos{i}.zip" for i in sorted(set(args.lote or []))]
+    fontes = {}
+    if args.baixar:
+        if not re.fullmatch(r"[0-9]{4}-(0[1-9]|1[0-2])", args.baixar):
+            parser.error("--baixar exige AAAA-MM")
+        args.pasta = args.pasta / args.baixar
+        arquivos = lotes or ARQUIVOS
+        if lotes and not args.todos_go and (args.uf != "GO" or normalizar(args.municipio) != "GOIANIA"):
+            arquivos = ["Municipios.zip", *lotes]
+        if args.limpar_downloads:
+            args.pasta.mkdir(parents=True, exist_ok=True)
+            faltantes = []
+            for nome in arquivos:
+                caminho = args.pasta / nome
+                if caminho.is_file() and zip_valido(caminho):
+                    fontes[nome] = caminho
+                else:
+                    faltantes.append(nome)
+            if faltantes:
+                temporario = Path(recursos.enter_context(TemporaryDirectory(
+                    prefix=".download-extrator-", dir=args.pasta
+                )))
+                baixar(temporario, args.baixar, faltantes)
+                fontes.update({nome: temporario / nome for nome in faltantes})
+        else:
+            baixar(args.pasta, args.baixar, arquivos)
+    args.municipios = fontes.get("Municipios.zip", args.pasta / "Municipios.zip")
+    args.empresas = sorted(args.pasta.glob("*.EMPRECSV"))
+    if args.arquivo:
+        args.estabelecimentos = list(dict.fromkeys(args.arquivo))
+        if any(c.suffix.lower() not in {".zip", ".estabele", ".stable"} for c in args.estabelecimentos):
+            raise ValueError("Escolha arquivos ZIP, .ESTABELE ou .stable")
+        pastas = {arquivo.parent for arquivo in args.estabelecimentos}
+        args.empresas = sorted({*args.empresas, *(c for pasta in pastas
+                              for padrao in ("*.EMPRECSV", "Empresas[0-9].zip")
+                              for c in pasta.glob(padrao))})
+    elif lotes:
+        args.estabelecimentos = [fontes.get(nome, args.pasta / nome) for nome in lotes]
+        faltantes = [caminho.name for caminho in args.estabelecimentos if not caminho.is_file()]
+        if faltantes:
+            raise ValueError("Arquivos selecionados ausentes: " + ", ".join(faltantes))
+        if not args.empresas:
+            args.empresas = sorted(args.pasta.glob("Empresas[0-9].zip"))
+    else:
+        args.estabelecimentos = sorted(
+            c for c in args.pasta.iterdir()
+            if c.is_file() and c.suffix.lower() in {".estabele", ".stable"}
+        ) if args.pasta.is_dir() else []
+        for atributo, prefixo in (("estabelecimentos", "Estabelecimentos"), ("empresas", "Empresas")):
+            arquivos_zip = [args.pasta / f"{prefixo}{i}.zip" for i in range(10)]
+            if not getattr(args, atributo) and any(caminho.exists() for caminho in arquivos_zip):
+                faltantes = [caminho.name for caminho in arquivos_zip if not caminho.is_file()]
+                if faltantes:
+                    raise ValueError("Lote incompleto, faltam " + ", ".join(faltantes))
+                setattr(args, atributo, arquivos_zip)
+    if not args.estabelecimentos:
+        raise ValueError(f"Nenhum arquivo .ESTABELE ou lote de ZIPs em {args.pasta}")
+    args.saida.parent.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(dir=args.saida.parent) as temp:
+        pasta_temp = Path(temp)
+        db = sqlite3.connect(pasta_temp / "contatos.sqlite")
+        try:
+            selecionar(args, db)
+            total = exportar(args, db, pasta_temp / "contatos.csv")
+        finally:
+            db.close()
+    if args.baixar and lotes:
+        registrar_extracao(args, lotes, total)
 
 
 if __name__ == "__main__":
