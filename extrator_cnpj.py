@@ -59,7 +59,8 @@ def baixar(pasta, competencia, arquivos=ARQUIVOS):
         print(f"Baixando {nome}", flush=True)
         subprocess.run([
             "curl", "--fail", "--location", "--retry", "3",
-            "--continue-at", "-",
+            "--retry-delay", "60", "--retry-max-time", "900",
+            "--connect-timeout", "20", "--continue-at", "-",
             "--output", str(parcial), f"{BASE}/{competencia}/{nome}",
         ], check=True)
         if not zip_valido(parcial):

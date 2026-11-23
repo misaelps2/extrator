@@ -1,5 +1,5 @@
 """Interface local para download e extração de dados públicos do CNPJ."""
-from concurrent.futures import ThreadPoolExecutor
+import csv
 import json
 from pathlib import Path
 from queue import Empty, Queue
@@ -7,10 +7,14 @@ import re
 import shutil
 import subprocess
 import sys
+from tempfile import TemporaryDirectory, mkdtemp
+from time import sleep
 from threading import Thread
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+from urllib.parse import unquote
 from urllib.request import Request, urlopen
+from xml.etree import ElementTree
 
 from extrator_cnpj import BASE
 
@@ -21,16 +25,20 @@ SUAVE = "#aac0cb"
 DESTAQUE = "#5de1b7"
 
 
-def tamanho_zip(competencia, lote):
-    nome = f"Estabelecimentos{lote}.zip"
-    try:
-        with urlopen(Request(f"{BASE}/{competencia}/{nome}", method="HEAD"), timeout=10) as resposta:
-            tamanho = int(resposta.headers.get("Content-Length", "0"))
-            if resposta.headers.get_content_type() == "application/zip" and tamanho > 0:
-                return tamanho
-    except (OSError, ValueError):
-        pass
-    return None
+MES = r"[0-9]{4}-(0[1-9]|1[0-2])"
+
+
+def listar_receita(pasta=""):
+    pedido = Request(f"{BASE}/{pasta}", headers={"Depth": "1"}, method="PROPFIND")
+    with urlopen(pedido, timeout=15) as resposta:
+        raiz = ElementTree.parse(resposta).getroot()
+    itens = {}
+    for entrada in raiz.findall("{DAV:}response"):
+        href = entrada.findtext("{DAV:}href", "")
+        nome = unquote(href.rstrip("/").rsplit("/", 1)[-1])
+        tamanho = entrada.findtext(".//{DAV:}getcontentlength")
+        itens[nome] = int(tamanho) if tamanho and tamanho.isdigit() else None
+    return itens
 
 
 def tamanho_formatado(bytes_):
@@ -38,14 +46,22 @@ def tamanho_formatado(bytes_):
     return f"{bytes_ / divisor:.2f}".replace(".", ",") + f" {unidade}"
 
 
-def consultar_tamanhos(competencia, eventos):
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        tamanhos = list(pool.map(lambda lote: tamanho_zip(competencia, lote), range(10)))
-    eventos.put(("tamanhos", (competencia, tamanhos)))
+def consultar_tamanhos(competencia, eventos, descobrir_meses):
+    try:
+        itens = listar_receita(f"{competencia}/")
+        tamanhos = [itens.get(f"Estabelecimentos{i}.zip") for i in range(10)]
+        eventos.put(("catalogo", (competencia, tamanhos)))
+        if descobrir_meses:
+            meses = sorted((nome for nome in listar_receita() if re.fullmatch(MES, nome)), reverse=True)
+            eventos.put(("meses", meses))
+    except (OSError, ValueError, ElementTree.ParseError) as erro:
+        eventos.put(("log", f"Consulta à Receita interrompida. {erro}"))
+    finally:
+        eventos.put(("consulta_concluida", None))
 
 
 def lotes_processados(competencia, pasta=Path("dump")):
-    if not re.fullmatch(r"[0-9]{4}-(0[1-9]|1[0-2])", competencia):
+    if not re.fullmatch(MES, competencia):
         return set()
     processados = set()
     for caminho in (pasta / competencia / "historico").glob("*.json"):
@@ -58,8 +74,9 @@ def lotes_processados(competencia, pasta=Path("dump")):
     return processados
 
 
-def executar(comando, eventos):
+def executar(comando, eventos, avisar_fim=True):
     resultado = "Falha na extração. Confira os detalhes abaixo."
+    sucesso = False
     try:
         with subprocess.Popen(
             comando, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -74,18 +91,73 @@ def executar(comando, eventos):
                     resultado = "Nenhum resultado para os filtros escolhidos."
                 elif " registros gravados em " in linha:
                     resultado = linha
-            if processo.wait() != 0:
+            sucesso = processo.wait() == 0
+            if not sucesso:
                 resultado = "Falha na extração. Confira os detalhes abaixo."
     except OSError as erro:
         eventos.put(("log", str(erro)))
-    eventos.put(("fim", resultado))
+    if avisar_fim:
+        eventos.put(("fim", resultado))
+    return sucesso
+
+
+def consolidar(saida, parciais):
+    vistos = set()
+    with TemporaryDirectory(dir=saida.parent) as pasta:
+        consolidado = Path(pasta) / "consolidado.csv"
+        with consolidado.open("w", encoding="utf-8-sig", newline="") as destino:
+            escritor = None
+            for parcial in parciais:
+                if not parcial.is_file():
+                    continue
+                with parcial.open(encoding="utf-8-sig", newline="") as arquivo:
+                    leitor = csv.DictReader(arquivo, delimiter=";")
+                    if escritor is None:
+                        escritor = csv.DictWriter(destino, fieldnames=leitor.fieldnames, delimiter=";")
+                        escritor.writeheader()
+                    for linha in leitor:
+                        cnpj = linha["CNPJ"]
+                        if cnpj not in vistos:
+                            escritor.writerow(linha)
+                            vistos.add(cnpj)
+        if vistos:
+            consolidado.replace(saida)
+    return len(vistos)
+
+
+def executar_fila(comando, eventos, fila, saida):
+    try:
+        saida.parent.mkdir(parents=True, exist_ok=True)
+        pasta = Path(mkdtemp(prefix=f"{saida.stem}_lotes_", dir=saida.parent))
+        parciais = []
+        for posicao, (mes, lote) in enumerate(fila, start=1):
+            if posicao > 1:
+                eventos.put(("log", "Aguardando 15 segundos antes do próximo lote."))
+                sleep(15)
+            eventos.put(("log", f"Lote {posicao}/{len(fila)} • {mes} / Estabelecimentos{lote}.zip"))
+            parcial = pasta / f"{mes}_lote{lote}.csv"
+            if not executar([*comando, "--baixar", mes, "--lote", lote, "--saida", str(parcial)],
+                            eventos, avisar_fim=False):
+                eventos.put(("fim", f"Fila interrompida no lote {posicao}. CSVs concluídos em {pasta}."))
+                return
+            parciais.append(parcial)
+        total = consolidar(saida, parciais)
+        if total:
+            eventos.put(("fim", f"{total} CNPJs únicos gravados em {saida}"))
+        else:
+            pasta.rmdir()
+            eventos.put(("fim", "Nenhum resultado nos lotes selecionados."))
+    except (OSError, ValueError, csv.Error) as erro:
+        eventos.put(("log", str(erro)))
+        eventos.put(("fim", "Falha ao processar a fila. Confira o registro abaixo."))
+
 
 
 def main():
     janela = tk.Tk()
     janela.title("Extrator CNPJ | Sify")
-    janela.geometry("790x760")
-    janela.minsize(680, 675)
+    janela.geometry("820x830")
+    janela.minsize(700, 730)
     janela.configure(background=FUNDO)
     tema = ttk.Style(janela)
     tema.theme_use("clam")
@@ -106,21 +178,24 @@ def main():
     painel = ttk.Frame(janela, padding=22)
     painel.pack(fill="both", expand=True)
     ttk.Label(painel, text="Extrator de CNPJ", font=("TkDefaultFont", 22, "bold")).pack(anchor="w")
-    ttk.Label(painel, text="Pequeno varejo • Selecione até dois ZIPs com Ctrl + clique.",
+    ttk.Label(painel, text="Pequeno varejo • Selecione ZIPs com Ctrl + clique e monte a fila por competência.",
               style="Nota.TLabel").pack(anchor="w", pady=(2, 12))
 
     config = ttk.Frame(painel)
     config.pack(fill="x", pady=(0, 8))
     competencia = tk.StringVar(value="2026-11")
     ttk.Label(config, text="Competência").pack(side="left")
-    ttk.Entry(config, width=9, textvariable=competencia).pack(side="left", padx=8)
+    meses = ttk.Combobox(config, width=9, textvariable=competencia)
+    meses.pack(side="left", padx=8)
     atualizar_botao = ttk.Button(config, text="Consultar tamanhos")
     atualizar_botao.pack(side="left")
 
-    lotes = ttk.Treeview(painel, columns=("arquivo", "tamanho", "historico"), show="headings", height=10)
+    lotes = ttk.Treeview(painel, columns=("arquivo", "tamanho", "historico", "fila"), show="headings", height=10)
     lotes.heading("arquivo", text="ZIP da Receita Federal")
     lotes.heading("tamanho", text="Tamanho no servidor")
     lotes.heading("historico", text="Histórico")
+    lotes.heading("fila", text="Fila")
+    lotes.column("fila", width=70, anchor="center")
     lotes.column("arquivo", width=290)
     lotes.column("historico", width=120)
     lotes.column("tamanho", width=170, anchor="e")
@@ -129,6 +204,15 @@ def main():
     lotes.pack(fill="x")
     resumo = tk.StringVar()
     ttk.Label(painel, textvariable=resumo, style="Nota.TLabel").pack(anchor="w", pady=(6, 8))
+
+    controles_fila = ttk.Frame(painel)
+    controles_fila.pack(fill="x")
+    adicionar = ttk.Button(controles_fila, text="Adicionar à fila")
+    adicionar.pack(side="left")
+    remover = ttk.Button(controles_fila, text="Remover selecionados")
+    remover.pack(side="left", padx=6)
+    zerar = ttk.Button(controles_fila, text="Limpar fila")
+    zerar.pack(side="left")
 
     filtros = ttk.Frame(painel)
     filtros.pack(fill="x", pady=6)
@@ -140,13 +224,13 @@ def main():
         ttk.Entry(filtros, width=12, textvariable=valor).pack(side="left", padx=(5, 12))
     ttk.Checkbutton(filtros, text="Todo Goiás (padrão: Goiânia)", variable=todos_go).pack(side="left")
 
-    limpar = tk.BooleanVar()
+    limpar = tk.BooleanVar(value=True)
     ttk.Checkbutton(painel, text="Liberar espaço após a extração (ZIPs desta execução)",
                     variable=limpar).pack(anchor="w", pady=(3, 0))
 
     acoes = ttk.Frame(painel)
     acoes.pack(fill="x", pady=(8, 5))
-    extrair = ttk.Button(acoes, text="Baixar e extrair", style="Acao.TButton")
+    extrair = ttk.Button(acoes, text="Executar fila", style="Acao.TButton")
     extrair.pack(side="left")
     local = ttk.Button(acoes, text="Abrir ZIP ou .ESTABELE local")
     local.pack(side="left", padx=8)
@@ -162,6 +246,7 @@ def main():
     tamanhos = {}
     consultando = False
     ativo = False
+    fila = set()
 
     def mostrar_resumo(*_):
         selecao = lotes.selection()
@@ -171,12 +256,14 @@ def main():
             texto = f"{len(selecao)} selecionado(s) • Tamanho total "
             texto += tamanho_formatado(sum(total)) if all(total) else "indisponível"
         livre = tamanho_formatado(shutil.disk_usage(Path.cwd()).free)
-        resumo.set(f"{texto}   ·   {livre} livres no disco de download")
+        resumo.set(f"{texto}   ·   {len(fila)} na fila   ·   {livre} livres")
 
     def consultar():
         nonlocal consultando
+        if ativo or consultando:
+            return
         mes = competencia.get().strip()
-        if not re.fullmatch(r"[0-9]{4}-(0[1-9]|1[0-2])", mes):
+        if not re.fullmatch(MES, mes):
             messagebox.showinfo("Competência", "Use o formato AAAA-MM.", parent=janela)
             return
         consultando = True
@@ -185,7 +272,7 @@ def main():
             lotes.set(lote, "tamanho", "Consultando…")
         if not ativo:
             barra.start(15)
-        Thread(target=consultar_tamanhos, args=(mes, eventos), daemon=True).start()
+        Thread(target=consultar_tamanhos, args=(mes, eventos, not meses["values"]), daemon=True).start()
 
     def atualizar_tabela(*_):
         mes = competencia.get().strip()
@@ -195,6 +282,7 @@ def main():
             lotes.set(lote, "tamanho", tamanho_formatado(valor) if valor else "—")
             nome = f"Estabelecimentos{lote}.zip"
             lotes.set(lote, "historico", "Já processado" if nome in processados else "—")
+            lotes.set(lote, "fila", "✓" if (mes, lote) in fila else "—")
         mostrar_resumo()
 
     def atualizar():
@@ -204,9 +292,12 @@ def main():
                 tipo, valor = eventos.get_nowait()
             except Empty:
                 break
-            if tipo == "tamanhos":
+            if tipo == "meses":
+                meses.configure(values=valor)
+            elif tipo == "catalogo":
                 mes, valores = valor
                 tamanhos.update({(mes, str(i)): tamanho for i, tamanho in enumerate(valores)})
+            elif tipo == "consulta_concluida":
                 consultando = False
                 atualizar_botao.state(["!disabled"])
                 atualizar_tabela()
@@ -216,6 +307,7 @@ def main():
                 ativo = False
                 extrair.state(["!disabled"])
                 local.state(["!disabled"])
+                atualizar_botao.state(["!disabled"])
                 status.set(valor)
                 atualizar_tabela()
                 if not consultando:
@@ -227,9 +319,23 @@ def main():
                 log.configure(state="disabled")
         janela.after(125, atualizar)
 
+    def editar_fila(acao):
+        mes = competencia.get().strip()
+        if acao == "limpar":
+            fila.clear()
+        elif re.fullmatch(MES, mes):
+            escolhidos = {(mes, lote) for lote in lotes.selection()}
+            if acao == "adicionar":
+                fila.update(escolhidos)
+            else:
+                fila.difference_update(escolhidos)
+        atualizar_tabela()
+
     def iniciar(arquivos_locais=False):
         nonlocal ativo
-        selecao = lotes.selection()
+        if consultando:
+            messagebox.showinfo("Receita Federal", "Aguarde a consulta em andamento.", parent=janela)
+            return
         arquivos = ()
         if arquivos_locais:
             arquivos = filedialog.askopenfilenames(
@@ -241,8 +347,8 @@ def main():
             if len(arquivos) > 2:
                 messagebox.showinfo("Seleção", "Escolha até dois arquivos.", parent=janela)
                 return
-        elif not 1 <= len(selecao) <= 2:
-            messagebox.showinfo("Seleção", "Escolha um ou dois ZIPs.", parent=janela)
+        elif not fila:
+            messagebox.showinfo("Fila", "Adicione os lotes que deseja processar.", parent=janela)
             return
         saida = filedialog.asksaveasfilename(
             title="Salvar CSV", initialfile="pequeno_varejo.csv", defaultextension=".csv",
@@ -251,28 +357,30 @@ def main():
         if not saida:
             return
         extrator = Path(__file__).with_name("extrator_cnpj.py").resolve()
-        comando = [sys.executable, str(extrator), "--saida", saida,
+        comando = [sys.executable, str(extrator),
                    "--inicio", inicio.get().strip(), "--fim", fim.get().strip()]
         if todos_go.get():
             comando.append("--todos-go")
         if arquivos_locais:
+            comando.extend(["--saida", saida])
             for arquivo in arquivos:
                 comando.extend(["--arquivo", arquivo])
+            alvo, argumentos = executar, (comando, eventos)
         else:
-            comando.extend(["--baixar", competencia.get().strip()])
             if limpar.get():
                 comando.append("--limpar-downloads")
-            for lote in selecao:
-                comando.extend(["--lote", lote])
+            ordenados = sorted(fila, key=lambda item: (item[0], -int(item[1])), reverse=True)
+            alvo, argumentos = executar_fila, (comando, eventos, ordenados, Path(saida))
         log.configure(state="normal")
         log.delete("1.0", "end")
         log.configure(state="disabled")
         extrair.state(["disabled"])
         local.state(["disabled"])
+        atualizar_botao.state(["disabled"])
         status.set("Processando arquivos…")
         ativo = True
         barra.start(15)
-        Thread(target=executar, args=(comando, eventos), daemon=True).start()
+        Thread(target=alvo, args=argumentos, daemon=True).start()
 
     def fechar():
         if ativo:
@@ -281,6 +389,10 @@ def main():
             janela.destroy()
 
     atualizar_botao.configure(command=consultar)
+    meses.bind("<<ComboboxSelected>>", lambda _: consultar())
+    adicionar.configure(command=lambda: editar_fila("adicionar"))
+    remover.configure(command=lambda: editar_fila("remover"))
+    zerar.configure(command=lambda: editar_fila("limpar"))
     extrair.configure(command=iniciar)
     local.configure(command=lambda: iniciar(arquivos_locais=True))
     lotes.bind("<<TreeviewSelect>>", mostrar_resumo)
